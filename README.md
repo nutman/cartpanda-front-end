@@ -85,11 +85,10 @@ All colors and styles defined in `index.css` using CSS custom properties:
 ## ⚖️ Tradeoffs & What I'd Improve
 
 ### Current Tradeoffs
-1. **No undo/redo** - Would require command pattern or state history
-2. **No snap-to-grid** - React Flow supports this but adds complexity
-3. **Basic validation** - Only checks connections, not business logic
-4. **No node editing** - Labels and buttons are static after creation
-5. **localStorage only** - No cloud sync or collaboration
+1. **No snap-to-grid** - React Flow supports this but adds complexity
+2. **Basic validation** - Only checks connections, not business logic
+3. **No node editing** - Labels and buttons are static after creation
+4. **localStorage only** - No cloud sync or collaboration
 
 ### Future Improvements
 1. **Undo/Redo** - Implement with `use-undo` or custom history stack

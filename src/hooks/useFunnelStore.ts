@@ -76,11 +76,29 @@ export function useFunnelStore() {
   const [labelCounts, setLabelCounts] = useState(createLabelCounter);
   const [isInitialized, setIsInitialized] = useState(false);
 
-  // Undo/Redo state
-  const historyRef = useRef<HistoryState[]>([]);
+  // Undo/Redo state - use React state so changes are reactive
+  const [history, setHistory] = useState<HistoryState[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(-1);
   const currentIndexRef = useRef(-1);
   const isUndoRedoRef = useRef(false);
   const isInitialLoadRef = useRef(true);
+  const isValidationUpdateRef = useRef(false);
+  const isDraggingRef = useRef(false);
+  const dragDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Keep ref in sync with state for reading in callbacks
+  useEffect(() => {
+    currentIndexRef.current = currentIndex;
+  }, [currentIndex]);
+
+  // Cleanup debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (dragDebounceTimerRef.current) {
+        clearTimeout(dragDebounceTimerRef.current);
+      }
+    };
+  }, []);
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -90,7 +108,7 @@ export function useFunnelStore() {
         const state: FunnelState = JSON.parse(saved);
         setNodes(state.nodes);
         setEdges(state.edges);
-        
+
         // Reconstruct label counts from saved nodes
         const counts = createLabelCounter();
         state.nodes.forEach((node) => {
@@ -127,8 +145,12 @@ export function useFunnelStore() {
       if (isInitialLoadRef.current) {
         isInitialLoadRef.current = false;
         // Initialize history with first state
-        historyRef.current = [{ nodes: JSON.parse(JSON.stringify(nodes)), edges: JSON.parse(JSON.stringify(edges)) }];
-        currentIndexRef.current = 0;
+        const initialState: HistoryState = {
+          nodes: JSON.parse(JSON.stringify(nodes)),
+          edges: JSON.parse(JSON.stringify(edges)),
+        };
+        setHistory([initialState]);
+        setCurrentIndex(0);
         return;
       }
 
@@ -137,30 +159,86 @@ export function useFunnelStore() {
         return;
       }
 
-      // Take snapshot for undo/redo
+      // Skip history entries for internal validation-only node updates
+      if (isValidationUpdateRef.current) {
+        isValidationUpdateRef.current = false;
+        return;
+      }
+
+      // If dragging, debounce history snapshot to avoid creating entry per pixel
+      if (isDraggingRef.current) {
+        // Clear existing timer
+        if (dragDebounceTimerRef.current) {
+          clearTimeout(dragDebounceTimerRef.current);
+        }
+
+        // Capture current state for the timer callback
+        const currentNodes = JSON.parse(JSON.stringify(nodes));
+        const currentEdges = JSON.parse(JSON.stringify(edges));
+
+        // Set new timer to create history after drag ends (300ms delay)
+        dragDebounceTimerRef.current = setTimeout(() => {
+          isDraggingRef.current = false;
+          dragDebounceTimerRef.current = null;
+
+          // Create history snapshot after drag ends using captured state
+          const currentState: HistoryState = {
+            nodes: currentNodes,
+            edges: currentEdges,
+          };
+
+          setHistory((prevHistory) => {
+            const sliced = prevHistory.slice(0, currentIndexRef.current + 1);
+            const nextHistory = [...sliced, currentState];
+
+            let nextIndex: number;
+            if (nextHistory.length > MAX_HISTORY_SIZE) {
+              nextHistory.shift();
+              nextIndex = MAX_HISTORY_SIZE - 1;
+            } else {
+              nextIndex = nextHistory.length - 1;
+            }
+
+            setCurrentIndex(nextIndex);
+            return nextHistory;
+          });
+        }, 300);
+
+        return;
+      }
+
+      // Take snapshot for undo/redo (non-dragging changes)
       const currentState: HistoryState = {
         nodes: JSON.parse(JSON.stringify(nodes)),
         edges: JSON.parse(JSON.stringify(edges)),
       };
 
-      // Remove any future states if we're not at the end
-      const newHistory = historyRef.current.slice(0, currentIndexRef.current + 1);
-      newHistory.push(currentState);
+      // Build new history array, dropping any \"future\" states if we've undone
+      setHistory((prevHistory) => {
+        const sliced = prevHistory.slice(0, currentIndexRef.current + 1);
+        const nextHistory = [...sliced, currentState];
 
-      // Limit history size
-      if (newHistory.length > MAX_HISTORY_SIZE) {
-        newHistory.shift();
-      } else {
-        currentIndexRef.current++;
-      }
+        // Enforce max history size and compute new index
+        let nextIndex: number;
+        if (nextHistory.length > MAX_HISTORY_SIZE) {
+          nextHistory.shift();
+          nextIndex = MAX_HISTORY_SIZE - 1;
+        } else {
+          nextIndex = nextHistory.length - 1;
+        }
 
-      historyRef.current = newHistory;
+        setCurrentIndex(nextIndex);
+        return nextHistory;
+      });
     }
   }, [nodes, edges, isInitialized]);
 
   // Validate funnel and update warnings
   useEffect(() => {
     if (!isInitialized) return;
+
+    // Mark that the next nodes update comes from validation logic
+    isValidationUpdateRef.current = true;
 
     setNodes((nds) =>
       nds.map((node) => {
@@ -200,7 +278,22 @@ export function useFunnelStore() {
   }, [edges, isInitialized]);
 
   const onNodesChange: OnNodesChange<FunnelNode> = useCallback(
-    (changes) => setNodes((nds) => applyNodeChanges(changes, nds) as FunnelNode[]),
+    (changes) => {
+      // Detect position changes - these indicate dragging
+      const hasPositionChange = changes.some(
+        (change) => change.type === 'position' && change.position !== undefined
+      );
+
+      if (hasPositionChange) {
+        // Mark as dragging - history will be debounced
+        isDraggingRef.current = true;
+      } else {
+        // Non-position change (select, remove, etc.) - not dragging
+        isDraggingRef.current = false;
+      }
+
+      setNodes((nds) => applyNodeChanges(changes, nds) as FunnelNode[]);
+    },
     []
   );
 
@@ -216,7 +309,7 @@ export function useFunnelStore() {
       if (sourceNode?.data.nodeType === 'thankYou') {
         return;
       }
-      
+
       setEdges((eds) =>
         addEdge({ ...connection, animated: true }, eds)
       );
@@ -227,11 +320,11 @@ export function useFunnelStore() {
   const addNode = useCallback(
     (nodeType: NodeType, position: { x: number; y: number }) => {
       const config = NODE_TYPE_CONFIG[nodeType];
-      
+
       setLabelCounts((prev) => {
         const newCount = prev[nodeType] + 1;
         const newCounts = { ...prev, [nodeType]: newCount };
-        
+
         // Create the label
         let label = config.label;
         if (nodeType === 'upsell' || nodeType === 'downsell') {
@@ -252,7 +345,7 @@ export function useFunnelStore() {
         };
 
         setNodes((nds) => [...nds, newNode]);
-        
+
         return newCounts;
       });
     },
@@ -281,7 +374,15 @@ export function useFunnelStore() {
       }
       setNodes(state.nodes);
       setEdges(state.edges);
-      
+
+      // Reset history to imported state
+      const importedState: HistoryState = {
+        nodes: JSON.parse(JSON.stringify(state.nodes)),
+        edges: JSON.parse(JSON.stringify(state.edges)),
+      };
+      setHistory([importedState]);
+      setCurrentIndex(0);
+
       // Reconstruct label counts
       const counts = createLabelCounter();
       state.nodes.forEach((node) => {
@@ -294,7 +395,7 @@ export function useFunnelStore() {
         }
       });
       setLabelCounts(counts);
-      
+
       return true;
     } catch (e) {
       console.error('Failed to import funnel:', e);
@@ -306,27 +407,32 @@ export function useFunnelStore() {
     setNodes([]);
     setEdges([]);
     setLabelCounts(createLabelCounter());
+
+    // Reset history to empty state
+    const emptyState: HistoryState = { nodes: [], edges: [] };
+    setHistory([emptyState]);
+    setCurrentIndex(0);
   }, []);
 
   const getValidationErrors = useCallback(() => {
     const errors: string[] = [];
-    
+
     // Check for orphan nodes
     const orphanNodes = nodes.filter((node) => {
       if (node.data.nodeType === 'salesPage') return false;
       return !edges.some((e) => e.target === node.id);
     });
-    
+
     if (orphanNodes.length > 0) {
       errors.push(`${orphanNodes.length} orphan node(s) not connected to funnel`);
     }
-    
+
     // Check for missing Thank You page
     const hasThankYou = nodes.some((n) => n.data.nodeType === 'thankYou');
     if (!hasThankYou && nodes.length > 0) {
       errors.push('No Thank You page in funnel');
     }
-    
+
     // Check for Sales Page connection
     const salesPages = nodes.filter((n) => n.data.nodeType === 'salesPage');
     salesPages.forEach((sp) => {
@@ -341,34 +447,36 @@ export function useFunnelStore() {
 
   // Undo function
   const undo = useCallback(() => {
-    if (currentIndexRef.current <= 0) return;
+    if (currentIndex <= 0) return;
 
     isUndoRedoRef.current = true;
-    currentIndexRef.current--;
-    const previousState = historyRef.current[currentIndexRef.current];
-    
+    const newIndex = currentIndex - 1;
+    setCurrentIndex(newIndex);
+    const previousState = history[newIndex];
+
     if (previousState) {
       setNodes(JSON.parse(JSON.stringify(previousState.nodes)));
       setEdges(JSON.parse(JSON.stringify(previousState.edges)));
     }
-  }, []);
+  }, [currentIndex, history]);
 
   // Redo function
   const redo = useCallback(() => {
-    if (currentIndexRef.current >= historyRef.current.length - 1) return;
+    if (currentIndex >= history.length - 1) return;
 
     isUndoRedoRef.current = true;
-    currentIndexRef.current++;
-    const nextState = historyRef.current[currentIndexRef.current];
-    
+    const newIndex = currentIndex + 1;
+    setCurrentIndex(newIndex);
+    const nextState = history[newIndex];
+
     if (nextState) {
       setNodes(JSON.parse(JSON.stringify(nextState.nodes)));
       setEdges(JSON.parse(JSON.stringify(nextState.edges)));
     }
-  }, []);
+  }, [currentIndex, history]);
 
-  const canUndo = currentIndexRef.current > 0;
-  const canRedo = currentIndexRef.current < historyRef.current.length - 1;
+  const canUndo = currentIndex > 0;
+  const canRedo = currentIndex < history.length - 1;
 
   return {
     nodes,
